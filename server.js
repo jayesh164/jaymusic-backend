@@ -1,9 +1,12 @@
 const express = require('express');
 const cors = require('cors');
-const ytDlp = require('yt-dlp-exec');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
+
+const execFileAsync = promisify(execFile);
 
 const app = express();
 app.use(cors());
@@ -16,31 +19,51 @@ if (process.env.YT_COOKIES_BASE64) {
     cookiesFile = path.join('/tmp', 'yt-cookies.txt');
     fs.writeFileSync(cookiesFile,
       Buffer.from(process.env.YT_COOKIES_BASE64, 'base64').toString('utf-8'));
-    console.log('[init] YouTube cookies loaded, size:', fs.statSync(cookiesFile).size);
+    console.log('[init] cookies loaded, size:', fs.statSync(cookiesFile).size);
   } catch (e) {
     console.error('[init] cookies failed:', e.message);
   }
-} else {
-  console.log('[init] YT_COOKIES_BASE64 not set');
+}
+
+// ==================== YT-DLP HELPER ====================
+// Direct yt-dlp binary call (no npm wrapper)
+async function runYtDlp(args) {
+  const ytdlpBin = process.env.YTDLP_BIN || '/usr/local/bin/yt-dlp';
+  try {
+    const { stdout } = await execFileAsync(ytdlpBin, args, {
+      maxBuffer: 50 * 1024 * 1024,
+      timeout: 60000
+    });
+    return stdout;
+  } catch (e) {
+    console.error('[yt-dlp error]', e.message);
+    if (e.stderr) console.error('[yt-dlp stderr]', e.stderr);
+    throw e;
+  }
 }
 
 // ==================== YOUTUBE SEARCH ====================
 async function youtubeSearch(query, limit = 20) {
   try {
-    const result = await ytDlp(`ytsearch${limit}:${query}`, {
-      dumpSingleJson: true,
-      flatPlaylist: true,
-      noWarnings: true,
-      cookies: cookiesFile,
-      skipDownload: true
-    });
+    const args = [
+      `ytsearch${limit}:${query}`,
+      '--dump-single-json',
+      '--flat-playlist',
+      '--no-warnings',
+      '--skip-download'
+    ];
+    if (cookiesFile) args.push('--cookies', cookiesFile);
+
+    const stdout = await runYtDlp(args);
+    const result = JSON.parse(stdout);
     const entries = result.entries || [result];
+
     return entries.map(e => ({
       source: 'youtube',
       id: e.id,
       title: e.title || 'Unknown',
       artist: e.uploader || e.channel || 'YouTube',
-      artwork: e.thumbnails?.[e.thumbnails.length - 1]?.url,
+      artwork: e.thumbnails?.[e.thumbnails.length - 1]?.url || e.thumbnail,
       durationMs: (e.duration || 0) * 1000,
       streamUrl: null,
       youtubeUrl: `https://www.youtube.com/watch?v=${e.id}`
@@ -53,53 +76,50 @@ async function youtubeSearch(query, limit = 20) {
 
 // ==================== YOUTUBE STREAM URL ====================
 async function youtubeStreamUrl(videoId) {
-  // Try multiple clients — ANDROID_VR, WEB, IOS
-  const clients = ['android_vr', 'web', 'ios'];
+  const clients = ['android_vr', 'web', 'ios', 'tv_embedded'];
 
   for (const client of clients) {
     try {
-      const info = await ytDlp(`https://www.youtube.com/watch?v=${videoId}`, {
-        dumpSingleJson: true,
-        format: 'bestaudio/best',
-        noWarnings: true,
-        cookies: cookiesFile,
-        skipDownload: true,
-        extractorArgs: `youtube:player_client=${client}`
-      });
+      const args = [
+        `https://www.youtube.com/watch?v=${videoId}`,
+        '--dump-single-json',
+        '--no-warnings',
+        '--skip-download',
+        '--extractor-args', `youtube:player_client=${client}`
+      ];
+      if (cookiesFile) args.push('--cookies', cookiesFile);
 
-      // direct url
+      const stdout = await runYtDlp(args);
+      const info = JSON.parse(stdout);
+
+      // If format not picked, pick from formats list
       if (info.url) {
-        console.log(`[yt stream] ${client} OK`);
+        console.log(`[yt stream] ${client} OK direct`);
         return info.url;
       }
 
-      // pick best audio format
       if (info.formats && info.formats.length) {
+        // prefer audio-only
         const audio = info.formats
           .filter(f => f.acodec && f.acodec !== 'none' && f.url)
           .sort((a, b) => (b.abr || 0) - (a.abr || 0))[0];
         if (audio && audio.url) {
-          console.log(`[yt stream] ${client} OK (format pick)`);
+          console.log(`[yt stream] ${client} OK audio-only`);
           return audio.url;
         }
-      }
-
-      // fallback: any format with url
-      if (info.formats) {
+        // any
         const any = info.formats.find(f => f.url);
         if (any) {
-          console.log(`[yt stream] ${client} OK (any format)`);
+          console.log(`[yt stream] ${client} OK any`);
           return any.url;
         }
       }
 
-      console.log(`[yt stream] ${client} — no url in response`);
+      console.log(`[yt stream] ${client} — no url`);
     } catch (e) {
-      console.error(`[yt stream] ${client} failed:`, e.message);
+      console.error(`[yt stream] ${client} failed`);
     }
   }
-
-  console.error('[yt stream] all clients failed for', videoId);
   return null;
 }
 
@@ -142,49 +162,24 @@ async function jiosaavnSearch(query, limit = 30) {
 // ==================== CACHE ====================
 const cache = new Map();
 const TTL = 3600 * 1000;
-const cGet = k => {
-  const v = cache.get(k);
-  if (!v || Date.now() > v.e) { cache.delete(k); return null; }
-  return v.v;
-};
+const cGet = k => { const v = cache.get(k); if (!v || Date.now() > v.e) { cache.delete(k); return null; } return v.v; };
 const cSet = (k, v) => cache.set(k, { v, e: Date.now() + TTL });
 
 // ==================== ROUTES ====================
+app.get('/health', (_, res) => res.json({ ok: true, cookies: !!cookiesFile, ts: Date.now() }));
 
-app.get('/health', (_, res) => res.json({
-  ok: true,
-  cookies: !!cookiesFile,
-  ts: Date.now()
-}));
-
-// DEBUG — cookies format check
 app.get('/debug-cookies', (req, res) => {
-  if (!cookiesFile) {
-    return res.json({ error: 'cookies file not set' });
-  }
+  if (!cookiesFile) return res.json({ error: 'not set' });
   try {
     const content = fs.readFileSync(cookiesFile, 'utf-8');
-    const lines = content.split('\n').slice(0, 5);
-    const isNetscape = content.includes('# Netscape HTTP Cookie File')
-                       || content.trim().startsWith('.youtube.com')
-                       || content.trim().startsWith('#HttpOnly_');
-    const isJSON = content.trim().startsWith('[')
-                   || content.trim().startsWith('{');
     res.json({
-      firstLines: lines,
-      isNetscape,
-      isJSON,
-      totalLength: content.length,
-      verdict: isJSON ? 'WRONG — JSON format'
-             : isNetscape ? 'OK — Netscape format'
-             : 'UNCLEAR — check firstLines'
+      firstLines: content.split('\n').slice(0, 5),
+      isNetscape: content.includes('# Netscape HTTP Cookie File'),
+      totalLength: content.length
     });
-  } catch (e) {
-    res.json({ error: e.message });
-  }
+  } catch (e) { res.json({ error: e.message }); }
 });
 
-// SEARCH
 app.get('/search', async (req, res) => {
   const q = req.query.q;
   const source = req.query.source || 'all';
@@ -197,12 +192,10 @@ app.get('/search', async (req, res) => {
   try {
     let results = [];
     if (source === 'youtube' || source === 'all') {
-      const yt = await youtubeSearch(q, 20);
-      results = results.concat(yt);
+      results = results.concat(await youtubeSearch(q, 20));
     }
     if (source === 'jiosaavn' || source === 'all') {
-      const js = await jiosaavnSearch(q, 15);
-      results = results.concat(js);
+      results = results.concat(await jiosaavnSearch(q, 15));
     }
     const out = { query: q, source, results };
     cSet(key, out);
@@ -212,7 +205,6 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// STREAM
 app.get('/stream', async (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ error: 'missing id' });
